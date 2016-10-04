@@ -15,7 +15,7 @@
 #include <plat/gpio-cfg.h>
 #include <plat/devs.h>
 
-#if defined(CONFIG_V1A) || defined(CONFIG_V2A)
+#if defined(CONFIG_V1A)
 extern void vienna_motor_init(void);
 #else
 #include <linux/mfd/max77803.h>
