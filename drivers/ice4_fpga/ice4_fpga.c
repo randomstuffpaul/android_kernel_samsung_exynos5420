@@ -1,7 +1,7 @@
 /*
- * driver/barcode_emul ice4 fpga driver
+ * driver/ice40lm fpga driver
  *
- * Copyright (C) 2012 Samsung Electronics
+ * Copyright (C) 2013 Samsung Electronics
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -18,108 +18,99 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  *
  */
-
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/err.h>
 #include <linux/i2c.h>
-#include <linux/irq.h>
-#include <linux/interrupt.h>
+#include <linux/i2c-gpio.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/workqueue.h>
 #include <linux/device.h>
-#include <linux/spinlock.h>
 #include <linux/gpio.h>
-#include <linux/uaccess.h>
-#include <linux/fs.h>
 #include <linux/err.h>
-#include <mach/gpio-exynos.h>
+#include <linux/platform_data/ice40lm.h>
+#include <linux/regulator/consumer.h>
+#include <linux/sec_sysfs.h>
+#include <linux/firmware.h>
 
-#if defined(CONFIG_ICE4_TWO_FUNC_INPUT)
-#if defined(CONFIG_CHAGALL) || defined(CONFIG_KLIMT)
-#include "ice4_fpga_ch.h"
-#else
-#include "ice4_fpga_v1a.h"
-#endif
-#include <linux/i2c-gpio.h>
-#else
-#include "ice4_fpga.h"
-#endif
+#if defined (CONFIG_OF)
+#include <linux/of_device.h>
+#include <linux/of_gpio.h>
+#endif /* CONFIG_OF */
 
-#if defined(TEST_DEBUG)
-#define pr_barcode	pr_emerg
-#else
-#define pr_barcode	pr_info
-#endif
+#include "ice40lm_k_640.h"
 
-#define LOOP_BACK	48
-#define TEST_CODE1	49
-#define TEST_CODE2	50
-#define FW_VER_ADDR	0x80
-#define BEAM_STATUS_ADDR	0xFE
-#define BARCODE_EMUL_MAX_FW_PATH	255
-#define BARCODE_EMUL_FW_FILENAME		"i2c_top_bitmap.bin"
+/* to enable mclk */
+#include <asm/io.h>
+#include <linux/clk.h>
 
-#define BARCODE_I2C_ADDR	0x6C
-
-#if defined(CONFIG_IR_REMOCON_FPGA)
-#define IRDA_I2C_ADDR		0x50
-#define IRDA_TEST_CODE_SIZE	141
+#define IRDA_TEST_CODE_SIZE	144
 #define IRDA_TEST_CODE_ADDR	0x00
-#define MAX_SIZE		2048
 #define READ_LENGTH		8
-#endif
 
-struct ice4_fpga_data {
-	struct i2c_client		*client;
-#if defined(CONFIG_IR_REMOCON_FPGA)
-	struct mutex			mutex;
-	struct {
-		unsigned char addr;
-		unsigned char data[MAX_SIZE];
-	} i2c_block_transfer;
-	int count;
-	int dev_id;
-	int ir_freq;
-	int ir_sum;
-#endif
+#define US_TO_PATTERN		1000000
+#define MIN_FREQ		20000
+
+/* K 3G FW has a limitation of data register : 1000 */
+enum {
+	REG_LIMIT = 990,
 };
 
-static int fw_loaded = 0;
-#if defined(CONFIG_IR_REMOCON_FPGA)
-static int ack_number;
-static int count_number;
-#endif
+struct ice4_fpga_data {
+	struct workqueue_struct		*firmware_dl;
+	struct delayed_work		fw_dl;
+	const struct firmware		*fw;
+	struct i2c_client *client;
+	struct regulator *regulator;
+	char *regulator_name;
+	struct mutex mutex;
+	struct {
+		unsigned char addr;
+		unsigned char data[REG_LIMIT];
+	} i2c_block_transfer;
+	int i2c_len;
 
-static struct workqueue_struct *barcode_init_wq;
-static void barcode_init_workfunc(struct work_struct *work);
-static DECLARE_WORK(barcode_init_work, barcode_init_workfunc);
+	int ir_freq;
+	int ir_sum;
+	struct clk *clock;
+};
+
+enum {
+	PWR_ALW,
+	PWR_REG,
+	PWR_LDO,
+};
+
+static struct ice40lm_platform_data *g_pdata;
+static int fw_loaded = 0;
+static bool send_success = false;
+static int power_type = PWR_ALW;
+
 /*
  * Send barcode emulator firmware data through spi communication
+ * Firmware Update Code
  */
-static int barcode_send_firmware_data(unsigned char *data)
+static int fw_data_send(const u8 *data, int length)
 {
 	unsigned int i,j;
 	unsigned char spibit;
 
 	i=0;
-	while (i < CONFIGURATION_SIZE) {
+	while (i < length) {
 		j=0;
 		spibit = data[i];
 		while (j < 8) {
-			gpio_set_value(GPIO_FPGA_SPI_CLK, GPIO_LEVEL_LOW);
+			gpio_set_value(g_pdata->spi_clk_scl, GPIO_LEVEL_LOW);
 
 			if (spibit & 0x80) {
-				gpio_set_value(GPIO_FPGA_SPI_SI,GPIO_LEVEL_HIGH);
+				gpio_set_value(g_pdata->spi_si_sda,GPIO_LEVEL_HIGH);
 			} else {
-				gpio_set_value(GPIO_FPGA_SPI_SI,GPIO_LEVEL_LOW);
+				gpio_set_value(g_pdata->spi_si_sda,GPIO_LEVEL_LOW);
 			}
 			j = j+1;
-			gpio_set_value(GPIO_FPGA_SPI_CLK, GPIO_LEVEL_HIGH);
+			gpio_set_value(g_pdata->spi_clk_scl, GPIO_LEVEL_HIGH);
 			spibit = spibit<<1;
 		}
 		i = i+1;
@@ -127,193 +118,63 @@ static int barcode_send_firmware_data(unsigned char *data)
 
 	i = 0;
 	while (i < 200) {
-		gpio_set_value(GPIO_FPGA_SPI_CLK, GPIO_LEVEL_LOW);
+		gpio_set_value(g_pdata->spi_clk_scl, GPIO_LEVEL_LOW);
 		i = i+1;
-		gpio_set_value(GPIO_FPGA_SPI_CLK, GPIO_LEVEL_HIGH);
+		gpio_set_value(g_pdata->spi_clk_scl, GPIO_LEVEL_HIGH);
 	}
 	return 0;
 }
 
-static int check_fpga_cdone(void)
-{
-    /* Device in Operation when CDONE='1'; Device Failed when CDONE='0'. */
-	if (gpio_get_value(GPIO_FPGA_CDONE) != 1) {
-		pr_barcode("CDONE_FAIL %d\n",gpio_get_value(GPIO_FPGA_CDONE));
-		return 0;
-	} else {
-		pr_barcode("CDONE_SUCCESS\n");
-		return 1;
-	}
-}
-
-
-static int barcode_fpga_fimrware_update_start(unsigned char *data)
+static int fw_update_start(const u8 *data, int length)
 {
 	int retry_count = 0;
 
-	pr_barcode("%s\n", __func__);
+	pr_info("ice40: %s\n", __func__);
 
-	gpio_request_one(GPIO_FPGA_CDONE, GPIOF_IN, "FPGA_CDONE");
-	gpio_request_one(GPIO_FPGA_SPI_CLK, GPIOF_OUT_INIT_LOW, "FPGA_SPI_CLK");
-	gpio_request_one(GPIO_FPGA_SPI_SI, GPIOF_OUT_INIT_LOW, "FPGA_SPI_SI");
-	gpio_request_one(GPIO_FPGA_SPI_EN, GPIOF_OUT_INIT_LOW, "FPGA_SPI_EN");
-	gpio_request_one(GPIO_FPGA_CRESET_B, GPIOF_OUT_INIT_HIGH, "FPGA_CRESET_B");
-#if !defined(CONFIG_ICE4_TWO_FUNC_INPUT)
-	gpio_request_one(GPIO_FPGA_RST_N, GPIOF_OUT_INIT_LOW, "FPGA_RST_N");
-#endif
-
-	gpio_set_value(GPIO_FPGA_CRESET_B, GPIO_LEVEL_LOW);
+	gpio_set_value(g_pdata->creset_b, GPIO_LEVEL_LOW);
 	usleep_range(30, 40);
 
-	gpio_set_value(GPIO_FPGA_CRESET_B, GPIO_LEVEL_HIGH);
+	gpio_set_value(g_pdata->creset_b, GPIO_LEVEL_HIGH);
 	usleep_range(1000, 1100);
 
-	while(!check_fpga_cdone()) {
+	while(!ice4_check_cdone()) {
 		usleep_range(10, 20);
-		barcode_send_firmware_data(data);
+		fw_data_send(data, length);
 		usleep_range(50, 60);
 
 		if (retry_count > 9) {
-			pr_barcode("barcode firmware update is NOT loaded\n");
+			pr_info("ice40lm firmware update is NOT loaded\n");
 			break;
 		} else {
 			retry_count++;
 		}
 	}
-	if (check_fpga_cdone()) {
-#if defined(CONFIG_ICE4_TWO_FUNC_INPUT)
-		gpio_set_value(GPIO_FPGA_SPI_EN, GPIO_LEVEL_HIGH);
-#else
-		gpio_set_value(GPIO_FPGA_RST_N, GPIO_LEVEL_HIGH);
-#endif
-		pr_barcode("barcode firmware update success\n");
+	if (ice4_check_cdone()) {
+		gpio_set_value(g_pdata->spi_en_rstn, GPIO_LEVEL_HIGH);
+		pr_info("ice40lm firmware update success\n");
 		fw_loaded = 1;
 	} else {
-		pr_barcode("Finally, fail to update barcode firmware!\n");
+		pr_info("Finally, fail to update ice40lm firmware!\n");
 	}
 
-	gpio_free(GPIO_FPGA_SPI_SI);
-	gpio_free(GPIO_FPGA_SPI_CLK);
 	return 0;
 }
 
-void barcode_fpga_firmware_update(void)
+void fw_update(struct work_struct *work)
 {
-#if defined(CONFIG_ICE4_TWO_FUNC_INPUT)
-	gpio_free(GPIO_FPGA_SPI_CLK);
-	gpio_free(GPIO_FPGA_SPI_SI);
-
-	barcode_fpga_fimrware_update_start(spiword);
-
-	gpio_free(GPIO_FPGA_SPI_CLK);
-	gpio_free(GPIO_FPGA_SPI_SI);
-
-	gpio_request(GPIO_FPGA_SPI_SI, "sda");
-	gpio_request(GPIO_FPGA_SPI_CLK, "scl");
-#else
-	barcode_fpga_fimrware_update_start(spiword);
-#endif
-}
-
-static ssize_t barcode_emul_store(struct device *dev, struct device_attribute *attr,
-		const char *buf, size_t size)
-{
-	int ret;
-	struct ice4_fpga_data *data = dev_get_drvdata(dev);
+	struct ice4_fpga_data *data =
+		container_of(work, struct ice4_fpga_data, fw_dl.work);
 	struct i2c_client *client = data->client;
-	pr_barcode("%s start\n", __func__);
 
-	if (gpio_get_value(GPIO_FPGA_CDONE) != 1) {
-		pr_err("%s: cdone fail !!\n", __func__);
-		return 1;
-	}
+	pr_info("ice40: %s\n", __func__);
 
-	client->addr = BARCODE_I2C_ADDR;
-	ret = i2c_master_send(client, buf, size);
-	if (ret < 0) {
-		pr_err("%s: i2c err1 %d\n", __func__, ret);
-		ret = i2c_master_send(client, buf, size);
-		if (ret < 0)
-			pr_err("%s: i2c err2 %d\n", __func__, ret);
-	}
-
-	pr_barcode("%s complete\n", __func__);
-	return size;
+	if (request_firmware(&data->fw, "ice40lm/k640.fw", &client->dev))
+		pr_err("%s: Fail to open firmware file\n", __func__);
+	else
+		fw_update_start(data->fw->data, data->fw->size);
 }
 
-static ssize_t barcode_emul_show(struct device *dev, struct device_attribute *attr,
-		char *buf)
-{
-	return strlen(buf);
-}
-static DEVICE_ATTR(barcode_send, 0664, barcode_emul_show, barcode_emul_store);
-
-static ssize_t barcode_emul_fw_update_store(struct device *dev, struct device_attribute *attr,
-		const char *buf, size_t size)
-{
-	struct file *fp = NULL;
-	long fsize = 0, nread = 0;
-	const u8 *buff = 0;
-	char fw_path[BARCODE_EMUL_MAX_FW_PATH+1];
-	mm_segment_t old_fs = get_fs();
-
-	pr_barcode("%s\n", __func__);
-
-	old_fs = get_fs();
-	set_fs(get_ds());
-
-	snprintf(fw_path, BARCODE_EMUL_MAX_FW_PATH,
-		"/sdcard/%s", BARCODE_EMUL_FW_FILENAME);
-
-	fp = filp_open(fw_path, O_RDONLY, 0);
-	if (!fp)
-		goto err_fp;
-
-	if (IS_ERR(fp)) {
-		pr_err("file %s open error:%d\n",
-			fw_path, (s32)fp);
-		goto err_open;
-	}
-
-	fsize = fp->f_path.dentry->d_inode->i_size;
-	pr_barcode("barcode firmware size: %ld\n", fsize);
-
-	buff = kzalloc((size_t)fsize, GFP_KERNEL);
-	if (!buff) {
-		pr_err("fail to alloc buffer for fw\n");
-		goto err_alloc;
-	}
-
-	nread = vfs_read(fp, (char __user *)buff, fsize, &fp->f_pos);
-	if (nread != fsize) {
-		pr_err("fail to read file %s (nread = %ld)\n",
-			fw_path, nread);
-		goto err_fw_size;
-	}
-
-	barcode_fpga_fimrware_update_start((unsigned char *)buff);
-
-err_fw_size:
-	kfree(buff);
-
-err_alloc:
-	filp_close(fp, NULL);
-
-err_open:
-	set_fs(old_fs);
-
-err_fp:
-	return size;
-}
-
-static ssize_t barcode_emul_fw_update_show(struct device *dev, struct device_attribute *attr,
-		char *buf)
-{
-	return strlen(buf);
-}
-static DEVICE_ATTR(barcode_fw_update, 0664, barcode_emul_fw_update_show, barcode_emul_fw_update_store);
-
-static int barcode_emul_read(struct i2c_client *client, u16 addr, u8 length, u8 *value)
+static int ice40lm_read(struct i2c_client *client, u16 addr, u8 length, u8 *value)
 {
 
 	struct i2c_msg msg[2];
@@ -333,319 +194,117 @@ static int barcode_emul_read(struct i2c_client *client, u16 addr, u8 length, u8 
 	if  (ret == 2) {
 		return 0;
 	} else {
-		pr_barcode("%s: err1 %d\n", __func__, ret);
+		pr_info("%s: err1 %d\n", __func__, ret);
 		return -EIO;
 	}
 }
 
-static ssize_t barcode_emul_test_store(struct device *dev, struct device_attribute *attr,
-		const char *buf, size_t size)
-{
-	int ret, i;
-	struct ice4_fpga_data *data = dev_get_drvdata(dev);
-	struct i2c_client *client = data->client;
-	struct {
-		unsigned char addr;
-		unsigned char data[20];
-	} i2c_block_transfer;
-	unsigned char barcode_data[14] = {0xFF, 0xAC, 0xDB, 0x36, 0x42, 0x85, 0x0A, 0xA8, 0xD1, 0xA3, 0x46, 0xC5, 0xDA, 0xFF};
-
-	client->addr = BARCODE_I2C_ADDR;
-	if (gpio_get_value(GPIO_FPGA_CDONE) != 1) {
-		pr_err("%s: cdone fail !!\n", __func__);
-		return 1;
-	}
-
-	if (buf[0] == LOOP_BACK) {
-		for (i = 0; i < size; i++)
-			i2c_block_transfer.data[i] = *buf++;
-
-		i2c_block_transfer.addr = 0x01;
-		pr_barcode("%s: write addr: %d, value: %d\n", __func__,
-			i2c_block_transfer.addr, i2c_block_transfer.data[0]);
-
-		ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 2);
-		if (ret < 0) {
-			pr_barcode("%s: err1 %d\n", __func__, ret); ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 2);
-			if (ret < 0)
-				pr_barcode("%s: err2 %d\n", __func__, ret);
-		}
-	} else if (buf[0] == TEST_CODE1) {
-		unsigned char BSR_data[6] =\
-			{0xC8, 0x00, 0x32, 0x01, 0x00, 0x32};
-
-		pr_barcode("barcode test code start\n");
-
-		/* send NH */
-		i2c_block_transfer.addr = 0x80;
-		i2c_block_transfer.data[0] = 0x05;
-		ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 2);
-		if (ret < 0) {
-			pr_err("%s: err1 %d\n", __func__, ret);
-			ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 2);
-			if (ret < 0)
-				pr_err("%s: err2 %d\n", __func__, ret);
-		}
-
-		/* setup BSR data */
-		for (i = 0; i < 6; i++)
-			i2c_block_transfer.data[i+1] = BSR_data[i];
-
-		/* send BSR1 => NS 1= 200, ISD 1 = 100us, IPD 1 = 200us, BL 1=14, BW 1=4MHZ */
-		i2c_block_transfer.addr = 0x81;
-		i2c_block_transfer.data[0] = 0x00;
-
-		ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 8);
-		if (ret < 0) {
-			pr_err("%s: err1 %d\n", __func__, ret);
-			ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 8);
-			if (ret < 0)
-				pr_err("%s: err2 %d\n", __func__, ret);
-		}
-
-		/* send BSR2 => NS 2= 200, ISD 2 = 100us, IPD 2 = 200us, BL 2=14, BW 2=2MHZ*/
-		i2c_block_transfer.addr = 0x88;
-		i2c_block_transfer.data[0] = 0x01;
-
-		ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 8);
-		if (ret < 0) {
-			pr_err("%s: err1 %d\n", __func__, ret);
-			ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 8);
-			if (ret < 0)
-				pr_err("%s: err2 %d\n", __func__, ret);
-		}
-
-		/* send BSR3 => NS 3= 200, ISD 3 = 100us, IPD 3 = 200us, BL 3=14, BW 3=1MHZ*/
-		i2c_block_transfer.addr = 0x8F;
-		i2c_block_transfer.data[0] = 0x02;
-
-		ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 8);
-		if (ret < 0) {
-			pr_err("%s: err1 %d\n", __func__, ret);
-			ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 8);
-			if (ret < 0)
-				pr_err("%s: err2 %d\n", __func__, ret);
-		}
-
-		/* send BSR4 => NS 4= 200, ISD 4 = 100us, IPD 4 = 200us, BL 4=14, BW 4=500KHZ*/
-		i2c_block_transfer.addr = 0x96;
-		i2c_block_transfer.data[0] = 0x04;
-
-		ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 8);
-		if (ret < 0) {
-			pr_err("%s: err1 %d\n", __func__, ret);
-			ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 8);
-			if (ret < 0)
-				pr_err("%s: err2 %d\n", __func__, ret);
-		}
-
-		/* send BSR5 => NS 5= 200, ISD 5 = 100us, IPD 5 = 200us, BL 5=14, BW 5=250KHZ*/
-		i2c_block_transfer.addr = 0x9D;
-		i2c_block_transfer.data[0] = 0x08;
-
-		ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 8);
-		if (ret < 0) {
-			pr_err("%s: err1 %d\n", __func__, ret);
-			ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 8);
-			if (ret < 0)
-				pr_err("%s: err2 %d\n", __func__, ret);
-		}
-
-		/* send barcode data */
-		i2c_block_transfer.addr = 0x00;
-		for (i = 0; i < 14; i++)
-			i2c_block_transfer.data[i] = barcode_data[i];
-
-		ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 15);
-		if (ret < 0) {
-			pr_err("%s: err1 %d\n", __func__, ret);
-			ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 15);
-			if (ret < 0)
-				pr_err("%s: err2 %d\n", __func__, ret);
-		}
-
-		/* send START */
-		i2c_block_transfer.addr = 0xFF;
-		i2c_block_transfer.data[0] = 0x0E;
-		ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 2);
-		if (ret < 0) {
-			pr_err("%s: err1 %d\n", __func__, ret);
-			ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 2);
-			if (ret < 0)
-				pr_err("%s: err2 %d\n", __func__, ret);
-		}
-	} else if (buf[0] == TEST_CODE2) {
-		pr_barcode("barcode test code stop\n");
-
-		i2c_block_transfer.addr = 0xFF;
-		i2c_block_transfer.data[0] = 0x00;
-		ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 2);
-		if (ret < 0) {
-			pr_err("%s: err1 %d\n", __func__, ret);
-			ret = i2c_master_send(client, (unsigned char *) &i2c_block_transfer, 2);
-			if (ret < 0)
-				pr_err("%s: err2 %d\n", __func__, ret);
-		}
-	}
-	return size;
-}
-
-static ssize_t barcode_emul_test_show(struct device *dev, struct device_attribute *attr,
-		char *buf)
-{
-	return strlen(buf);
-}
-static DEVICE_ATTR(barcode_test_send, 0664, barcode_emul_test_show, barcode_emul_test_store);
-
-static ssize_t barcode_ver_check_show(struct device *dev, struct device_attribute *attr,
-		char *buf)
-{
-	struct ice4_fpga_data *data = dev_get_drvdata(dev);
-	u8 fw_ver;
-
-	data->client->addr = BARCODE_I2C_ADDR;
-	barcode_emul_read(data->client, FW_VER_ADDR, 1, &fw_ver);
-	fw_ver = (fw_ver >> 5) & 0x7;
-
-	return sprintf(buf, "%d\n", fw_ver+14);
-
-}
-static DEVICE_ATTR(barcode_ver_check, 0664, barcode_ver_check_show, NULL);
-
-static ssize_t barcode_led_status_show(struct device *dev, struct device_attribute *attr,
-		char *buf)
-{
-	struct ice4_fpga_data *data = dev_get_drvdata(dev);
-	u8 status;
-
-	data->client->addr = BARCODE_I2C_ADDR;
-	barcode_emul_read(data->client, BEAM_STATUS_ADDR, 1, &status);
-	status = status & 0x1;
-
-	return sprintf(buf, "%d\n", status);
-}
-static DEVICE_ATTR(barcode_led_status, 0664, barcode_led_status_show, NULL);
-
-#if defined(CONFIG_IR_REMOCON_FPGA)
 /* When IR test does not work, we need to check some gpios' status */
-static void print_fpga_gpio_status(void)
+static void ice40lm_print_gpio_status(void)
 {
+/* to guess the status of CDONE during probe time */
 	if (!fw_loaded)
-		printk(KERN_ERR "%s : firmware is not loaded\n", __func__);
+		pr_info("%s : firmware is not loaded\n", __func__);
 	else
-		printk(KERN_ERR "%s : firmware is loaded\n", __func__);
+		pr_info("%s : firmware is loaded\n", __func__);
 
-	printk(KERN_ERR "%s : CDONE    : %d\n", __func__, gpio_get_value(GPIO_FPGA_CDONE));
-#if defined(CONFIG_ICE4_TWO_FUNC_INPUT)
-	printk(KERN_ERR "%s : RST_N    : %d\n", __func__, gpio_get_value(GPIO_FPGA_SPI_EN));
-#else
-	printk(KERN_ERR "%s : RST_N    : %d\n", __func__, gpio_get_value(GPIO_FPGA_RST_N));
-#endif
-	printk(KERN_ERR "%s : CRESET_B : %d\n", __func__, gpio_get_value(GPIO_FPGA_CRESET_B));
+	pr_info("%s : CDONE    : %d\n", __func__, gpio_get_value(g_pdata->cdone));
+	pr_info("%s : RST_N    : %d\n", __func__, gpio_get_value(g_pdata->spi_en_rstn));
+	pr_info("%s : CRESET_B : %d\n", __func__, gpio_get_value(g_pdata->creset_b));
 }
-/* sysfs node ir_send */
-static void ir_remocon_work(struct ice4_fpga_data *ir_data, int count)
+
+static int ice4_check_cdone(void)
+{
+	if (!g_pdata->cdone) {
+		pr_info("%s : no cdone pin data\n", __func__);
+		return 0;
+	}
+
+	/* Device in Operation when CDONE='1'; Device Failed when CDONE='0'. */
+	if (gpio_get_value(g_pdata->cdone) != 1) {
+		pr_info("%s : CDONE_FAIL %d\n", __func__,
+				gpio_get_value(g_pdata->cdone));
+		return 0;
+	}
+
+	return 1;
+}
+
+static int ir_send_data_to_device(struct ice4_fpga_data *ir_data)
 {
 
 	struct ice4_fpga_data *data = ir_data;
 	struct i2c_client *client = data->client;
-
-	int buf_size = count+2;
-	int ret;
-	int sleep_timing;
-	int end_data;
-	int emission_time;
-	int ack_pin_onoff;
+	int buf_size = data->i2c_len;
 	int retry_count = 0;
+
+	int ret;
+	int emission_time;
+	int check_num;
+	static int count_number;
 
 #if defined(DEBUG)
 	u8 *temp;
 	int i;
-#endif
 
-	data->i2c_block_transfer.addr = 0x00;
-
-	data->i2c_block_transfer.data[0] = count >> 8;
-	data->i2c_block_transfer.data[1] = count & 0xff;
-
-#if defined(DEBUG)
 	temp = kzalloc(sizeof(u8)*(buf_size+20), GFP_KERNEL);
 	if (NULL == temp)
 		pr_err("Failed to data allocate %s\n", __func__);
 #endif
 
+	/* count the number of sending */
 	if (count_number >= 100)
 		count_number = 0;
 
 	count_number++;
 
-	printk(KERN_INFO "%s: total buf_size: %d\n", __func__, buf_size);
+	pr_info("%s: total buf_size: %d\n", __func__, buf_size);
 
 	mutex_lock(&data->mutex);
-
-	client->addr = IRDA_I2C_ADDR;
-
-	buf_size++;
-	ret = i2c_master_send(client,
-		(unsigned char *) &(data->i2c_block_transfer), buf_size);
+	ret = i2c_master_send(client, (unsigned char *) &(data->i2c_block_transfer), buf_size);
 	if (ret < 0) {
 		dev_err(&client->dev, "%s: err1 %d\n", __func__, ret);
-		ret = i2c_master_send(client,
-		(unsigned char *) &(data->i2c_block_transfer), buf_size);
+		ret = i2c_master_send(client, (unsigned char *) &(data->i2c_block_transfer), buf_size);
 		if (ret < 0) {
 			dev_err(&client->dev, "%s: err2 %d\n", __func__, ret);
-			print_fpga_gpio_status();
+			ice40lm_print_gpio_status();
 		}
 	}
 
 #if defined(DEBUG)
-	barcode_emul_read(client, IRDA_TEST_CODE_ADDR, buf_size, temp);
+	/* Registers can be read with special firmware */
+//	ice40lm_read(client, IRDA_TEST_CODE_ADDR, buf_size, temp);
 
 	for (i = 0 ; i < buf_size; i++)
-		pr_err("%4d SEND %5d  RECV %5d\n", i,
-			data->i2c_block_transfer.data[i], temp[i]);
+		pr_info("[%s] %4d data %5x\n", __func__, i, data->i2c_block_transfer.data[i]);
+
+	kfree(temp);
 #endif
 
 	mdelay(10);
 
-	ack_pin_onoff = 0;
+	check_num = 0;
 
-	if (gpio_get_value(GPIO_IRDA_IRQ)) {
-		printk(KERN_INFO "%s : %d Checksum NG!\n",
-			__func__, count_number);
-		ack_pin_onoff = 1;
+	if (gpio_get_value(g_pdata->irda_irq)) {
+		pr_info("%s : %d before sending status NG\n", __func__, count_number);
+		check_num = 1;
 	} else {
-		printk(KERN_INFO "%s : %d Checksum OK!\n",
-			__func__, count_number);
-		ack_pin_onoff = 2;
+		pr_info("%s : %d before sending status OK!\n", __func__, count_number);
+		check_num = 2;
 	}
-	ack_number = ack_pin_onoff;
 
 	mutex_unlock(&data->mutex);
 
-	data->count = 2;
-
-#if 0
-	end_data = data->i2c_block_transfer.data[count-2] << 8
-		| data->i2c_block_transfer.data[count-1];
-	emission_time = \
-		(1000 * (data->ir_sum - end_data) / (data->ir_freq)) + 10;
-	sleep_timing = emission_time - 130;
-	if (sleep_timing > 0)
-		msleep(sleep_timing);
-#endif
-	emission_time = \
-		(1000 * (data->ir_sum) / (data->ir_freq));
-	if (emission_time > 0)
+	emission_time = (1000 * (data->ir_sum) / (data->ir_freq));
+	pr_info("%s : sum (%d) freq (%d) time (%d)\n", __func__, data->ir_sum, data->ir_freq, emission_time);
+	if (emission_time > 0) {
 		msleep(emission_time);
+		pr_info("%s: emission_time = %d\n", __func__, emission_time);
+	}
 
-	printk(KERN_INFO "%s: emission_time = %d\n",
-					__func__, emission_time);
-
-	while (!gpio_get_value(GPIO_IRDA_IRQ)) {
+	while (!gpio_get_value(g_pdata->irda_irq)) {
 		mdelay(10);
-		printk(KERN_INFO "%s : %d try to check IRDA_IRQ\n",
-					__func__, retry_count);
+		pr_info("%s : %d try to check IRDA_IRQ\n", __func__, retry_count);
 		retry_count++;
 
 		if (retry_count > 5) {
@@ -653,79 +312,208 @@ static void ir_remocon_work(struct ice4_fpga_data *ir_data, int count)
 		}
 	}
 
-	if (gpio_get_value(GPIO_IRDA_IRQ)) {
-		printk(KERN_INFO "%s : %d Sending IR OK!\n",
-				__func__, count_number);
-		ack_pin_onoff = 4;
+	if (gpio_get_value(g_pdata->irda_irq)) {
+		pr_info("%s : %d after  sending status OK!\n", __func__, count_number);
+		check_num += 4;
 	} else {
-		printk(KERN_INFO "%s : %d Sending IR NG!\n",
-				__func__, count_number);
-		ack_pin_onoff = 2;
+		pr_info("%s : %d after  sending status NG!\n", __func__, count_number);
+		check_num += 2;
 	}
 
-	ack_number += ack_pin_onoff;
-
-	data->ir_freq = 0;
-	data->ir_sum = 0;
+	if (check_num != 6 || retry_count != 0) {
+		pr_info("%s : fail to check the ir sending %d", __func__, check_num);
+		return -1;
+	} else {
+		pr_info("%s done", __func__);
+		return 0;
+	}
 }
 
-static ssize_t remocon_store(struct device *dev, struct device_attribute *attr,
+static int ice40lm_set_data(struct ice4_fpga_data *data, int *arg, int count)
+{
+	int i;
+	/* offset means 1 (slave address) + 2 (data size) + 3 (frequency data) */
+	int offset = 6;
+	int irdata_arg_size = count - 1;
+#ifdef CONFIG_REPEAT_ENABLE
+#if 0
+	/* SAMSUNG : upper word of the third byte in frequecy means the number of repeat frame */
+	int nr_repeat_frame = (arg[0] >> 20) & 0xF;
+#endif
+	/* PEEL : 1206 */
+	int nr_repeat_frame = (arg[1] >>  4) & 0xF;
+#else
+	int nr_repeat_frame = 0;
+#endif
+	/* remove the frequency data from the data length */
+	int irdata_size = irdata_arg_size - nr_repeat_frame;
+	int temp = 0, converting_factor;
+
+	/* calculate total length for i2c transferring */
+	data->i2c_len = irdata_arg_size * 2 + offset;
+
+	pr_info("%s : count %d\n", __func__, count);
+	pr_info("%s : irdata_arg_size %d\n", __func__, irdata_arg_size);
+	pr_info("%s : irdata_size %d\n", __func__, irdata_size);
+	pr_info("%s : i2c length %d\n", __func__, data->i2c_len);
+
+	data->i2c_block_transfer.addr = 0x00;
+
+	/* i2c address will be stored separatedly */
+	data->i2c_block_transfer.data[0] = ((data->i2c_len - 1) >> 8) & 0xFF;
+	data->i2c_block_transfer.data[1] = ((data->i2c_len - 1) >> 0) & 0xFF;
+
+	data->i2c_block_transfer.data[2] = (arg[0] >> 16) & 0xFF;
+	data->i2c_block_transfer.data[3] = (arg[0] >>  8) & 0xFF;
+	data->i2c_block_transfer.data[4] = (arg[0] >>  0) & 0xFF;
+	converting_factor = US_TO_PATTERN / arg[0];
+	/* i2c address will be stored separatedly */
+	offset--;
+
+	/* arg[1]~[end] are the data for i2c transferring */
+	for (i = 0 ; i < irdata_arg_size ; i++ ) {
+#ifdef DEBUG
+		pr_info("[%s] %d array value : %x\n", __func__, i, arg[i]);
+#endif
+		arg[i + 1] = (arg[i + 1] / converting_factor);
+		data->i2c_block_transfer.data[i * 2 + offset] = arg[i+1] >> 8;
+		data->i2c_block_transfer.data[i * 2 + offset + 1] = arg[i+1] & 0xFF;
+	}
+
+	/* +1 is for removing frequency data */
+#ifdef CONFIG_REPEAT_ENABLE
+	for (i = 1 ; i < irdata_arg_size ; i++)
+		temp = temp + arg[i + 1];
+#else
+	for (i = 0 ; i < irdata_arg_size ; i++)
+		temp = temp + arg[i + 1];
+#endif
+
+	data->ir_sum = temp;
+	data->ir_freq = arg[0];
+
+	return 0;
+}
+
+static void ir_led_power_control(bool led, struct ice4_fpga_data *data)
+{
+	int err;
+
+	if (led) {
+		if (power_type == PWR_REG) {
+			err = regulator_enable(data->regulator);
+			if (err)
+				pr_info("%s: fail to turn on regulator\b", __func__);
+		} else if (power_type == PWR_LDO) {
+			gpio_set_value(g_pdata->ir_en, GPIO_LEVEL_HIGH);
+		}
+	} else {
+		if (power_type == PWR_REG)
+			regulator_disable(data->regulator);
+		else if (power_type == PWR_LDO)
+			gpio_set_value(g_pdata->ir_en, GPIO_LEVEL_LOW);
+	}
+}
+
+/* start of sysfs code */
+static ssize_t ir_send_store(struct device *dev, struct device_attribute *attr,
 		const char *buf, size_t size)
 {
 	struct ice4_fpga_data *data = dev_get_drvdata(dev);
-	unsigned int _data;
-	int count, i;
+	int tdata, i, count = 0;
 
-	printk(KERN_INFO "%s : ir_send called\n", __func__);
+	int *arr_data;
+	int err;
+
+/* mclk on */
+	clk_prepare_enable(data->clock);
+
+	pr_info("%s : ir_send called with %d\n", __func__, size);
 	if (!fw_loaded) {
-		printk(KERN_ERR "%s : firmware is not loaded\n", __func__);
+		pr_info("%s : firmware is not loaded\n", __func__);
 		return 1;
 	}
 
-	for (i = 0; i < MAX_SIZE; i++) {
-		if (sscanf(buf++, "%u", &_data) == 1) {
-			if (_data == 0 || buf == '\0')
-				break;
+	/* arr_data will store the decimal data(int) from sysfs(char) */
+	/* every arr_data will be split by 2 (EX, 173(dec) will be 0x00(hex) and 0xAD(hex) */
+	arr_data = kmalloc((sizeof(int) * (REG_LIMIT/2)), GFP_KERNEL);
+	if (!arr_data) {
+		pr_info("%s: fail to alloc\n", __func__);
+		return size;
+	}
 
-			if (data->count == 2) {
-				data->ir_freq = _data;
-				data->i2c_block_transfer.data[2] = _data >> 16;
-				data->i2c_block_transfer.data[3]
-							= (_data >> 8) & 0xFF;
-				data->i2c_block_transfer.data[4] = _data & 0xFF;
+	ir_led_power_control(true, data);
 
-				data->count += 3;
-			} else {
-				data->ir_sum += _data;
-				count = data->count;
-				data->i2c_block_transfer.data[count]
-								= _data >> 8;
-				data->i2c_block_transfer.data[count+1]
-								= _data & 0xFF;
-				data->count += 2;
-			}
-
-			while (_data > 0) {
-				buf++;
-				_data /= 10;
-			}
-		} else {
+	for (i = 0 ; i < (REG_LIMIT/2) ; i++) {
+		tdata = simple_strtoul(buf++, NULL, 10);
+#ifdef DEBUG	/* debugging, it will cause lagging */
+		pr_info("[%s] %d sysfs value : %x\n", __func__, i, tdata);
+#endif
+		if (tdata < 0) {
+			pr_info("%s : error at simple_strtoul\n", __func__);
 			break;
+		} else if ((tdata == 0) && (i > 10)) {
+			pr_info("%s : end of sysfs input(%d)\n", __func__, i);
+			break;
+		}
+
+		arr_data[count] = tdata;
+		count++;
+
+		while (tdata > 0) {
+			buf++;
+			tdata = tdata / 10;
 		}
 	}
 
-	ir_remocon_work(data, data->count);
+	if (count >= (REG_LIMIT/2)) {
+		pr_info("[%s] OVERFLOW\n", __func__);
+		goto err_overflow;
+	}
+
+	pr_info("[%s] string to array size : %d\n", __func__, count);
+
+	err = ice40lm_set_data(data, arr_data, count);
+	if (err != 0)
+		pr_info("FAIL is possible?\n");
+
+	err = ir_send_data_to_device(data);
+	if (err != 0 && arr_data[0] > MIN_FREQ) {
+		pr_info("%s: IR SEND might fail, retry!\n", __func__);
+
+		err = ir_send_data_to_device(data);
+		if (err != 0) {
+			pr_info("%s: IR SEND might fail again\n", __func__);
+			send_success = false;
+		} else {
+			send_success = true;
+		}
+	} else {
+		send_success = true;
+	}
+
+err_overflow:
+	data->ir_freq = 0;
+	data->ir_sum = 0;
+
+	kfree(arr_data);
+
+	ir_led_power_control(false, data);
+
+/* mclk off */
+	clk_disable_unprepare(data->clock);
+
 	return size;
 }
 
-static ssize_t remocon_show(struct device *dev, struct device_attribute *attr,
+static ssize_t ir_send_show(struct device *dev, struct device_attribute *attr,
 		char *buf)
 {
 	struct ice4_fpga_data *data = dev_get_drvdata(dev);
 	int i;
 	char *bufp = buf;
 
-	for (i = 5; i < MAX_SIZE - 1; i++) {
+	for (i = 5; i < REG_LIMIT - 1; i++) {
 		if (data->i2c_block_transfer.data[i] == 0
 			&& data->i2c_block_transfer.data[i+1] == 0)
 			break;
@@ -735,59 +523,26 @@ static ssize_t remocon_show(struct device *dev, struct device_attribute *attr,
 	}
 	return strlen(buf);
 }
-#if defined(CONFIG_SEC_FACTORY)
-static DEVICE_ATTR(ir_send, 0666, remocon_show, remocon_store);
-#else
-static DEVICE_ATTR(ir_send, 0664, remocon_show, remocon_store);
-#endif
+
+static DEVICE_ATTR(ir_send, 0664, ir_send_show, ir_send_store);
+
 /* sysfs node ir_send_result */
-static ssize_t remocon_ack(struct device *dev, struct device_attribute *attr,
+static ssize_t ir_send_result_show(struct device *dev, struct device_attribute *attr,
 		char *buf)
 {
-	printk(KERN_INFO "%s : ack_number = %d\n", __func__, ack_number);
-
-	if (ack_number == 6)
+	if (send_success)
 		return sprintf(buf, "1\n");
 	else
 		return sprintf(buf, "0\n");
 }
 
-static DEVICE_ATTR(ir_send_result, 0664, remocon_ack, NULL);
-
-static int irda_read_device_info(struct ice4_fpga_data *ir_data)
+static ssize_t ir_send_result_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
 {
-	struct ice4_fpga_data *data = ir_data;
-	struct i2c_client *client = data->client;
-	u8 buf_ir_test[8];
-	int ret;
-
-	printk(KERN_INFO"%s called\n", __func__);
-
-	client->addr = IRDA_I2C_ADDR;
-	ret = i2c_master_recv(client, buf_ir_test, READ_LENGTH);
-
-	if (ret < 0)
-		dev_err(&client->dev, "%s: err %d\n", __func__, ret);
-
-	printk(KERN_INFO "%s: buf_ir dev_id: 0x%02x, 0x%02x\n", __func__,
-			buf_ir_test[2], buf_ir_test[3]);
-	ret = data->dev_id = (buf_ir_test[2] << 8 | buf_ir_test[3]);
-
-	return ret;
+	return size;
 }
+static DEVICE_ATTR(ir_send_result, 0664, ir_send_result_show, ir_send_result_store);
 
-/* sysfs node check_ir */
-static ssize_t check_ir_show(struct device *dev, struct device_attribute *attr,
-		char *buf)
-{
-	struct ice4_fpga_data *data = dev_get_drvdata(dev);
-	int ret;
-
-	ret = irda_read_device_info(data);
-	return snprintf(buf, 4, "%d\n", ret);
-}
-
-static DEVICE_ATTR(check_ir, 0664, check_ir_show, NULL);
 /* sysfs node irda_test */
 static ssize_t irda_test_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t size)
@@ -819,19 +574,26 @@ static ssize_t irda_test_store(struct device *dev,
 		0x3F, 0x00, 0x15, 0x00, 0x3F, 0x00, 0x15, 0x00,
 		0x3F, 0x00, 0x15, 0x00, 0x3F
 	};
+#if defined(DEBUG)
+	u8 *temp;
 
-	if (gpio_get_value(GPIO_FPGA_CDONE) != 1) {
+	temp = kzalloc(sizeof(u8)*(IRDA_TEST_CODE_SIZE+20), GFP_KERNEL);
+	if (NULL == temp)
+		pr_err("Failed to data allocate %s\n", __func__);
+#endif
+
+
+	if (gpio_get_value(g_pdata->cdone) != 1) {
 		pr_err("%s: cdone fail !!\n", __func__);
 		return 1;
 	}
-	pr_barcode("IRDA test code start\n");
+	pr_info("IRDA test code start\n");
 	if (!fw_loaded) {
-		printk(KERN_ERR "%s : firmware is not loaded\n", __func__);
+		pr_info("%s : firmware is not loaded\n", __func__);
 		return 1;
 	}
 
-	/* change address for IRDA */
-	client->addr = IRDA_I2C_ADDR;
+	ir_led_power_control(true, data);
 
 	/* make data for sending */
 	for (i = 0; i < IRDA_TEST_CODE_SIZE; i++)
@@ -849,6 +611,17 @@ static ssize_t irda_test_store(struct device *dev,
 			pr_err("%s: err2 %d\n", __func__, ret);
 	}
 
+#if defined(DEBUG)
+	ice40lm_read(client, IRDA_TEST_CODE_ADDR, IRDA_TEST_CODE_SIZE, temp);
+
+	for (i = 0 ; i < IRDA_TEST_CODE_SIZE; i++)
+		pr_info("[%s] %4d rd %5x, td %5x\n", __func__, i, i2c_block_transfer.data[i], temp[i]);
+
+	ice40lm_print_gpio_status();
+#endif
+	mdelay(200);
+	ir_led_power_control(false, data);
+
 	return size;
 }
 
@@ -859,39 +632,138 @@ static ssize_t irda_test_show(struct device *dev, struct device_attribute *attr,
 }
 
 static DEVICE_ATTR(irda_test, 0664, irda_test_show, irda_test_store);
-#endif
 
-static struct attribute *sec_barcode_emul_attributes[] = {
-	&dev_attr_barcode_send.attr,
-	&dev_attr_barcode_fw_update.attr,
-	&dev_attr_barcode_test_send.attr,
-	&dev_attr_barcode_ver_check.attr,
-	&dev_attr_barcode_led_status.attr,
-	NULL,
-};
+/* sysfs irda_version */
+static ssize_t irda_ver_check_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ice4_fpga_data *data = dev_get_drvdata(dev);
+
+	u8 fw_ver;
+	ice40lm_read(data->client, 0x02, 1, &fw_ver);
+	fw_ver = (fw_ver >> 2) & 0x3;
+
+	return sprintf(buf, "%d\n", fw_ver);
+}
+
+static DEVICE_ATTR(irda_ver_check, 0664, irda_ver_check_show, NULL);
+
 static struct attribute *sec_ir_attributes[] = {
 	&dev_attr_ir_send.attr,
 	&dev_attr_ir_send_result.attr,
-	&dev_attr_check_ir.attr,
 	&dev_attr_irda_test.attr,
+	&dev_attr_irda_ver_check.attr,
 	NULL,
 };
-static struct attribute_group sec_barcode_emul_attr_group = {
-	.attrs = sec_barcode_emul_attributes,
-};
+
 static struct attribute_group sec_ir_attr_group = {
 	.attrs = sec_ir_attributes,
 };
+/* end of sysfs code */
 
-static int __devinit barcode_emul_probe(struct i2c_client *client,
+#if defined(CONFIG_OF)
+static int of_ice40lm_dt(struct device *dev, struct ice40lm_platform_data *pdata,
+			struct ice4_fpga_data *data)
+{
+	struct device_node *np_ice40lm = dev->of_node;
+	const char *temp_str;
+	int ret;
+
+	if(!np_ice40lm)
+		return -EINVAL;
+
+	pdata->creset_b = of_get_named_gpio(np_ice40lm, "ice40lm,creset_b", 0);
+	pdata->cdone = of_get_named_gpio(np_ice40lm, "ice40lm,cdone", 0);
+	pdata->irda_irq = of_get_named_gpio(np_ice40lm, "ice40lm,irda_irq", 0);
+	pdata->spi_si_sda = of_get_named_gpio(np_ice40lm, "ice40lm,spi_si_sda", 0);
+	pdata->spi_clk_scl = of_get_named_gpio(np_ice40lm, "ice40lm,spi_clk_scl", 0);
+	pdata->spi_en_rstn = of_get_named_gpio(np_ice40lm, "ice40lm,spi_en_rstn", 0);
+
+	ret = of_property_read_string(np_ice40lm, "clock-names", &temp_str);
+	if (ret) {
+		pr_err("%s: cannot get clock name(%d)", __func__, ret);
+		return ret;
+	}
+	pr_info("%s: %s\n", __func__, temp_str);
+
+	data->clock = devm_clk_get(dev, temp_str);
+	if (IS_ERR(data->clock)) {
+		pr_err("%s: cannot get clock(%d)", __func__, ret);
+		return ret;
+	}
+
+	ret = of_property_read_string(np_ice40lm, "ice40lm,power", &temp_str);
+	if (ret) {
+		pr_err("%s: cannot get power type(%d)", __func__, ret);
+		return ret;
+	}
+
+	if (!strncasecmp(temp_str, "LDO", 3)) {
+		pr_info("%s: ice40lm will use %s\n", __func__, temp_str);
+		power_type = PWR_LDO;
+		pdata->ir_en = of_get_named_gpio(np_ice40lm, "ice40lm,ir_en", 0);
+	} else if (!strncasecmp(temp_str, "REG", 3)) {
+		pr_info("%s: ice40lm will use regulator\n", __func__);
+		power_type = PWR_REG;
+		ret = of_property_read_string(np_ice40lm, "ice40lm,regulator_name",
+								&temp_str);
+		if (ret) {
+			pr_err("%s: cannot get regulator_name!(%d)\n",
+				__func__, ret);
+			return ret;
+		}
+		data->regulator_name = (char *)temp_str;
+	} else if (!strncasecmp(temp_str, "ALW", 3)) {
+		pr_info("%s: ice40lm power control(%s)\n", __func__, temp_str);
+		power_type = PWR_ALW;
+	} else {
+		pr_err("%s: unused power type(%s)\n", __func__, temp_str);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+#else
+static int of_ice40lm_dt(struct device *dev, struct ice40lm_platform_data *pdata)
+{
+	return -ENODEV;
+}
+#endif /* CONFIG_OF */
+
+static int ice40lm_gpio_setting(void)
+{
+	int ret = 0;
+
+	ret = gpio_request_one(g_pdata->creset_b, GPIOF_OUT_INIT_HIGH, "FPGA_CRESET_B");
+	ret += gpio_request_one(g_pdata->cdone, GPIOF_IN, "FPGA_CDONE");
+	ret += gpio_request_one(g_pdata->irda_irq, GPIOF_IN, "FPGA_IRDA_IRQ");
+	ret += gpio_request_one(g_pdata->spi_en_rstn, GPIOF_OUT_INIT_LOW, "FPGA_SPI_EN");
+
+	if (power_type == PWR_LDO) {
+		if (g_pdata->spi_en_rstn != g_pdata->ir_en)
+			ret += gpio_request_one(g_pdata->ir_en, GPIOF_OUT_INIT_LOW, "FPGA_IR_EN");
+		else
+			pr_info("%s: skip duplicated gpio request\n", __func__);
+	}
+
+/* i2c-gpio drv already request below pins */
+	gpio_free(g_pdata->spi_si_sda);
+	gpio_free(g_pdata->spi_clk_scl);
+	ret += gpio_request_one(g_pdata->spi_si_sda, GPIOF_OUT_INIT_LOW, "FPGA_SPI_SI_SDA");
+	ret += gpio_request_one(g_pdata->spi_clk_scl, GPIOF_OUT_INIT_LOW, "FPGA_SPI_CLK_SCL");
+
+	return ret;
+}
+
+static int __devinit ice40lm_probe(struct i2c_client *client,
 		const struct i2c_device_id *id)
 {
 	struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
 	struct ice4_fpga_data *data;
-	struct device *barcode_emul_dev;
-	int error;
+	struct ice40lm_platform_data *pdata;
+	struct device *ice40lm_dev;
+	int error = 0;
 
-	pr_barcode("%s probe!\n", __func__);
+	pr_info("%s probe!\n", __func__);
 
 	if (!i2c_check_functionality(adapter, I2C_FUNC_I2C))
 		return -EIO;
@@ -899,61 +771,86 @@ static int __devinit barcode_emul_probe(struct i2c_client *client,
 	data = kzalloc(sizeof(struct ice4_fpga_data), GFP_KERNEL);
 	if (NULL == data) {
 		pr_err("Failed to data allocate %s\n", __func__);
+		error = -ENOMEM;
 		goto alloc_fail;
 	}
 
-#if !defined(CONFIG_ICE4_TWO_FUNC_INPUT)
-/* With this configuration, FW will be updated in workqueue */
-	if (check_fpga_cdone()) {
+	if (client->dev.of_node) {
+		pdata = devm_kzalloc(&client->dev,
+			sizeof(struct ice40lm_platform_data),
+				GFP_KERNEL);
+		if (!pdata) {
+			dev_err(&client->dev, "Failed to allocate memory\n");
+			error =  -ENOMEM;
+			goto platform_data_fail;
+		}
+		error = of_ice40lm_dt(&client->dev, pdata, data);
+		if (error)
+			goto platform_data_fail;
+	}
+	else
+		pdata = client->dev.platform_data;
+
+	g_pdata = pdata;
+	error = ice40lm_gpio_setting();
+	if (error)
+		goto platform_data_fail;
+
+	if (ice4_check_cdone()) {
 		fw_loaded = 1;
-		pr_barcode("FPGA FW is loaded!\n");
+		pr_info("FPGA FW is loaded!\n");
 	} else {
 		fw_loaded = 0;
-		pr_barcode("FPGA FW is NOT loaded!\n");
+		pr_info("FPGA FW is NOT loaded!\n");
 	}
-#endif
 
 	data->client = client;
-#if defined(CONFIG_IR_REMOCON_FPGA)
 	mutex_init(&data->mutex);
-	data->count = 2;
-#endif
+
 	i2c_set_clientdata(client, data);
-	barcode_emul_dev = device_create(sec_class, NULL, 0, data, "sec_barcode_emul");
-	if (IS_ERR(barcode_emul_dev))
-		pr_err("Failed to create barcode_emul_dev device\n");
 
-	if (sysfs_create_group(&barcode_emul_dev->kobj, &sec_barcode_emul_attr_group) < 0)
-		pr_err("Failed to create sysfs group for samsung barcode emul!\n");
+	/* slave address */
+	client->addr = 0x50;
 
-#if defined(CONFIG_IR_REMOCON_FPGA)
-	barcode_emul_dev = device_create(sec_class, NULL, 0, data, "sec_ir");
-	if (IS_ERR(barcode_emul_dev))
-		pr_err("Failed to create barcode_emul_dev device in sec_ir\n");
-
-	if (sysfs_create_group(&barcode_emul_dev->kobj, &sec_ir_attr_group) < 0)
-		pr_err("Failed to create sysfs group for samsung ir!\n");
-#endif
-#if defined(CONFIG_ICE4_TWO_FUNC_INPUT)
-	barcode_init_wq = create_singlethread_workqueue("barcode_init");
-	if (!barcode_init_wq) {
-		pr_err("fail to create wq\n");
-		goto err_create_wq;
+	if (power_type == PWR_REG) {
+		data->regulator	= regulator_get(NULL, data->regulator_name);
+		if (IS_ERR(data->regulator)) {
+			pr_info("%s Failed to get regulator.\n", __func__);
+			error = IS_ERR(data->regulator);
+			goto platform_data_fail;
+		}
 	}
-	queue_work(barcode_init_wq, &barcode_init_work);
+
+	ice40lm_dev = sec_device_create(data, "sec_ir");
+	if (IS_ERR(ice40lm_dev))
+		pr_err("Failed to create ice40lm_dev in sec_ir\n");
+
+	if (sysfs_create_group(&ice40lm_dev->kobj, &sec_ir_attr_group) < 0) {
+		sec_device_destroy(ice40lm_dev->devt);
+		pr_err("Failed to create sysfs group for samsung ir!\n");
+	}
+
+	/* Create dedicated thread so that the delay of our work does not affect others */
+	data->firmware_dl =
+		create_singlethread_workqueue("ice40_firmware_dl");
+	INIT_DELAYED_WORK(&data->fw_dl, fw_update);
+
+	/* min 1ms is needed */
+	queue_delayed_work(data->firmware_dl,
+			&data->fw_dl, msecs_to_jiffies(20));
+
 
 	pr_err("probe complete %s\n", __func__);
 
 	return 0;
 
-err_create_wq:
+platform_data_fail:
 	kfree(data);
-#endif
 alloc_fail:
-	return -ENOMEM;
+	return error;
 }
 
-static int __devexit barcode_emul_remove(struct i2c_client *client)
+static int __devexit ice40lm_remove(struct i2c_client *client)
 {
 	struct ice4_fpga_data *data = i2c_get_clientdata(client);
 
@@ -963,29 +860,21 @@ static int __devexit barcode_emul_remove(struct i2c_client *client)
 }
 
 #ifdef CONFIG_PM
-static int barcode_emul_suspend(struct device *dev)
+static int ice40lm_suspend(struct device *dev)
 {
-#if defined(CONFIG_ICE4_TWO_FUNC_INPUT)
-	gpio_set_value(GPIO_FPGA_SPI_EN, GPIO_LEVEL_LOW);
-#else
-	gpio_set_value(GPIO_FPGA_RST_N, GPIO_LEVEL_LOW);
-#endif
+	gpio_set_value(g_pdata->spi_en_rstn, GPIO_LEVEL_LOW);
 	return 0;
 }
 
-static int barcode_emul_resume(struct device *dev)
+static int ice40lm_resume(struct device *dev)
 {
-#if defined(CONFIG_ICE4_TWO_FUNC_INPUT)
-	gpio_set_value(GPIO_FPGA_SPI_EN, GPIO_LEVEL_HIGH);
-#else
-	gpio_set_value(GPIO_FPGA_RST_N, GPIO_LEVEL_HIGH);
-#endif
+	gpio_set_value(g_pdata->spi_en_rstn, GPIO_LEVEL_HIGH);
 	return 0;
 }
 
-static const struct dev_pm_ops barcode_emul_pm_ops = {
-	.suspend	= barcode_emul_suspend,
-	.resume		= barcode_emul_resume,
+static const struct dev_pm_ops ice40lm_pm_ops = {
+	.suspend	= ice40lm_suspend,
+	.resume		= ice40lm_resume,
 };
 #endif
 
@@ -995,84 +884,40 @@ static const struct i2c_device_id ice4_id[] = {
 };
 MODULE_DEVICE_TABLE(i2c, ice4_id);
 
+
+#if defined(CONFIG_OF)
+static struct of_device_id ice40lm_match_table[] = {
+	{ .compatible = "lattice,ice40lm",},
+	{},
+};
+#else
+#define ice40lm_match_table	NULL
+#endif
+
 static struct i2c_driver ice4_i2c_driver = {
 	.driver = {
 		.name	= "ice4",
+		.of_match_table = ice40lm_match_table,
 #ifdef CONFIG_PM
-		.pm	= &barcode_emul_pm_ops,
+		.pm	= &ice40lm_pm_ops,
 #endif
 	},
-	.probe = barcode_emul_probe,
-	.remove = __devexit_p(barcode_emul_remove),
+	.probe = ice40lm_probe,
+	.remove = __devexit_p(ice40lm_remove),
 	.id_table = ice4_id,
 };
 
-static void barcode_init_workfunc(struct work_struct *work)
+static int __init ice40lm_init(void)
 {
-	barcode_fpga_firmware_update();
+	return i2c_add_driver(&ice4_i2c_driver);
 }
+late_initcall(ice40lm_init);
 
-#if defined(CONFIG_ICE4_TWO_FUNC_INPUT)
-/* I2C22 */
-static struct i2c_gpio_platform_data gpio_i2c_data22 = {
-	.scl_pin = GPIO_FPGA_SPI_CLK,
-	.sda_pin = GPIO_FPGA_SPI_SI,
-	.udelay = 2,
-	.sda_is_open_drain = 0,
-	.scl_is_open_drain = 0,
-	.scl_is_output_only = 0,
-};
-
-struct platform_device s3c_device_i2c22 = {
-	.name = "i2c-gpio",
-	.id = 22,
-	.dev.platform_data = &gpio_i2c_data22,
-};
-
-static struct i2c_board_info i2c_devs22_emul[] __initdata = {
-	{
-		I2C_BOARD_INFO("ice4", (0x6c)),
-	},
-};
-
-static struct platform_device *universal5420_fpga_devices[] __initdata = {
-	&s3c_device_i2c22,
-};
-#endif
-
-static int __init barcode_emul_init(void)
-{
-#if !defined(CONFIG_ICE4_TWO_FUNC_INPUT)
-	barcode_init_wq = create_singlethread_workqueue("barcode_init");
-	if (!barcode_init_wq) {
-		pr_err("fail to create wq\n");
-		goto err_create_wq;
-	}
-	queue_work(barcode_init_wq, &barcode_init_work);
-#else
-
-	i2c_register_board_info(22, i2c_devs22_emul,
-		ARRAY_SIZE(i2c_devs22_emul));
-
-	platform_add_devices(universal5420_fpga_devices,
-		ARRAY_SIZE(universal5420_fpga_devices));
-#endif
-
-	i2c_add_driver(&ice4_i2c_driver);
-
-#if !defined(CONFIG_ICE4_TWO_FUNC_INPUT)
-err_create_wq:
-#endif
-	return 0;
-}
-late_initcall(barcode_emul_init);
-
-static void __exit barcode_emul_exit(void)
+static void __exit ice40lm_exit(void)
 {
 	i2c_del_driver(&ice4_i2c_driver);
-	destroy_workqueue(barcode_init_wq);
 }
-module_exit(barcode_emul_exit);
+module_exit(ice40lm_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("SEC Barcode emulator");
+MODULE_DESCRIPTION("ICE40LM FPGA FOR IRDA");
